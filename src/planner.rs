@@ -62,11 +62,15 @@ enum ExprScope {
 /// InfluxQL query planner
 pub struct InfluxQLToLogicalPlan<'a> {
     s: &'a dyn SchemaProvider,
+    measurement_column_name: String,
 }
 
 impl<'a> InfluxQLToLogicalPlan<'a> {
-    pub fn new(s: &'a dyn SchemaProvider) -> Self {
-        Self { s }
+    pub fn new(s: &'a dyn SchemaProvider, measurement_column_name: String) -> Self {
+        Self {
+            s,
+            measurement_column_name,
+        }
     }
 
     pub fn statement_to_plan(&self, statement: Statement) -> Result<LogicalPlan> {
@@ -241,7 +245,7 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
         //  See: https://github.com/influxdata/influxdb_iox/issues/7062
         let mut series_sort = if !plan_and_schemas.is_empty() {
             vec![Expr::sort(
-                INFLUXQL_MEASUREMENT_COLUMN_NAME.as_expr(),
+                self.measurement_column_name.as_expr(),
                 true,
                 false,
             )]
@@ -663,7 +667,10 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
                         MeasurementName::Name(ref ident) => {
                             let measurement_name = normalize_identifier(ident);
                             let schema = self.s.table_schema(measurement_name.as_str())
-                            .ok_or_else(||DataFusionError::Internal(format!("schema not found by measurement in FROM clause, measurement:{ident}")))?;
+                                .map_err(|e|
+                                    DataFusionError::Internal(format!("failed to search schema for measurement in FROM clause, measurement:{ident}, err:{e}"))
+                                )?
+                                .ok_or_else(||DataFusionError::Internal(format!("schema not found by measurement in FROM clause, measurement:{ident}")))?;
                             let plan = self.create_table_ref(measurement_name)?;
 
                             (plan, schema)
@@ -700,7 +707,7 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
         })?;
         project(
             LogicalPlanBuilder::scan(&table_name, source, None)?.build()?,
-            iter::once(lit_dict(&table_name).alias(INFLUXQL_MEASUREMENT_COLUMN_NAME)),
+            iter::once(lit_dict(&table_name).alias(self.measurement_column_name.clone())),
         )
     }
 }
@@ -988,7 +995,7 @@ mod test {
             ),
         ]);
 
-        let planner = InfluxQLToLogicalPlan::new(&sp);
+        let planner = InfluxQLToLogicalPlan::new(&sp, INFLUXQL_MEASUREMENT_COLUMN_NAME.to_string());
 
         planner.statement_to_plan(statements.pop().unwrap())
     }

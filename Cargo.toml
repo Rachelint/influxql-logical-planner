@@ -9,7 +9,7 @@ arrow = { version = "32.0.0", features = ["prettyprint"] }
 chrono = { version = "0.4", default-features = false }
 chrono-tz = { version = "0.8" }
 datafusion = "18.0.0"
-influxql-parser = { git = "https://github.com/Rachelint/influxql-parser.git" }
+influxql-parser = { git = "https://github.com/Rachelint/influxql-parser.git", rev = "6fd5d946843682c3559e1c172cf23a14d61495b9" }
 itertools = "0.10.5"
 once_cell = "1"
 regex = "1"
