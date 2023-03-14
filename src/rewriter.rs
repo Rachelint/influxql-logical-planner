@@ -29,7 +29,11 @@ fn rewrite_from(s: &dyn SchemaProvider, stmt: &mut SelectStatement) -> Result<()
                     name: MeasurementName::Name(name),
                     ..
                 } => {
-                    if s.table_exists(name) {
+                    if s.table_exists(name).map_err(|e|
+                        DataFusionError::Internal(format!(
+                            "failed to find schema for measurement in rewrite_from, measurement:{name}, err:{e}",
+                        ))
+                    )? {
                         new_from.push(ms.clone())
                     }
                 }
@@ -38,7 +42,12 @@ fn rewrite_from(s: &dyn SchemaProvider, stmt: &mut SelectStatement) -> Result<()
                     ..
                 } => {
                     let re = util::parse_regex(re)?;
-                    s.table_names()
+                    let table_names = s.table_names().map_err(|e| {
+                        DataFusionError::Internal(format!(
+                            "failed to find schema for measurement in rewrite_from, err:{e}",
+                        ))
+                    })?;
+                    table_names
                         .into_iter()
                         .filter(|table| re.is_match(table))
                         .for_each(|table| {

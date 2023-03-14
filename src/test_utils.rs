@@ -182,20 +182,21 @@ impl SchemaProvider for MockSchemaProvider {
             .ok_or_else(|| DataFusionError::Plan(format!("measurement does not exist: {name}")))
     }
 
-    fn table_names(&self) -> Vec<&'_ str> {
-        self.tables
+    fn table_names(&self) -> Result<Vec<&'_ str>> {
+        Ok(self
+            .tables
             .keys()
             .map(|k| k.as_str())
             .sorted()
-            .collect::<Vec<_>>()
+            .collect::<Vec<_>>())
     }
 
-    fn table_schema(&self, name: &str) -> Option<Arc<dyn Schema>> {
-        self.tables.get(name).map(|(_, schema)| schema.clone())
+    fn table_schema(&self, name: &str) -> Result<Option<Arc<dyn Schema>>> {
+        Ok(self.tables.get(name).map(|(_, schema)| schema.clone()))
     }
 
-    fn table_exists(&self, name: &str) -> bool {
-        self.table_names().contains(&name)
+    fn table_exists(&self, name: &str) -> Result<bool> {
+        Ok(self.table_names().unwrap().contains(&name))
     }
 }
 

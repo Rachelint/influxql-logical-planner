@@ -6,20 +6,18 @@ use datafusion::{common::DFSchemaRef, logical_expr::TableSource};
 
 /// The `SchemaProvider` trait allows the InfluxQL query planner to obtain
 /// meta-data about tables referenced in InfluxQL statements.
+// TODO: define the error for crate rather than use error of datafusion.
 pub trait SchemaProvider {
-    /// TODO: define the error for crate rather than use error of datafusion.
     fn get_table_provider(&self, name: &str) -> Result<Arc<dyn TableSource>>;
 
     /// The collection of tables for this schema.
-    fn table_names(&self) -> Vec<&'_ str>;
+    fn table_names(&self) -> Result<Vec<&'_ str>>;
 
     /// Test if a table with the specified `name` exists.
-    fn table_exists(&self, name: &str) -> bool {
-        self.table_names().contains(&name)
-    }
+    fn table_exists(&self, name: &str) -> Result<bool>;
 
     /// Get the schema for the specified `table`.
-    fn table_schema(&self, name: &str) -> Option<Arc<dyn Schema>>;
+    fn table_schema(&self, name: &str) -> Result<Option<Arc<dyn Schema>>>;
 }
 
 pub trait Schema: Send + Sync + 'static {

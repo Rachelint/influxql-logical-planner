@@ -4,6 +4,7 @@ use crate::provider::InfluxColumnType;
 use crate::provider::SchemaProvider;
 use crate::var_ref::field_type_to_var_ref_data_type;
 use datafusion::common::Result;
+use datafusion::error::DataFusionError;
 use influxql_parser::expression::VarRefDataType;
 use std::collections::{HashMap, HashSet};
 
@@ -14,7 +15,12 @@ pub(crate) fn field_and_dimensions(
     s: &dyn SchemaProvider,
     name: &str,
 ) -> Result<Option<(FieldTypeMap, TagSet)>> {
-    match s.table_schema(name) {
+    let schema = s.table_schema(name).map_err(|e| {
+        DataFusionError::Internal(format!(
+            "failed to find schema for measurement in field_and_dimensions, measurement:{name}, err:{e}",
+        ))
+    })?;
+    match schema {
         Some(iox) => Ok(Some((
             FieldTypeMap::from_iter(iox.columns().iter().filter_map(
                 |(col_type, f)| match col_type {
@@ -38,7 +44,12 @@ pub(crate) fn map_type(
     measurement_name: &str,
     field: &str,
 ) -> Result<Option<VarRefDataType>> {
-    match s.table_schema(measurement_name) {
+    let schema = s.table_schema(measurement_name).map_err(|e| {
+        DataFusionError::Internal(format!(
+            "failed to find schema for measurement in map_type, measurement:{measurement_name}, err:{e}",
+        ))
+    })?;
+    match schema {
         Some(iox) => Ok(match iox.find_index_of(field) {
             Some(i) => match iox.column(i).0 {
                 InfluxColumnType::Field(ft) => Some(field_type_to_var_ref_data_type(ft)),

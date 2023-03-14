@@ -34,7 +34,7 @@ use itertools::Itertools;
 use once_cell::sync::Lazy;
 use std::collections::{HashSet, VecDeque};
 
-use std::fmt::Debug;
+use std::fmt::{format, Debug};
 use std::iter;
 use std::ops::{ControlFlow, Deref};
 use std::str::FromStr;
@@ -663,7 +663,10 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
                         MeasurementName::Name(ref ident) => {
                             let measurement_name = normalize_identifier(ident);
                             let schema = self.s.table_schema(measurement_name.as_str())
-                            .ok_or_else(||DataFusionError::Internal(format!("schema not found by measurement in FROM clause, measurement:{ident}")))?;
+                                .map_err(|e|
+                                    DataFusionError::Internal(format!("failed to search schema for measurement in FROM clause, measurement:{ident}, err:{e}"))
+                                )?
+                                .ok_or_else(||DataFusionError::Internal(format!("schema not found by measurement in FROM clause, measurement:{ident}")))?;
                             let plan = self.create_table_ref(measurement_name)?;
 
                             (plan, schema)
