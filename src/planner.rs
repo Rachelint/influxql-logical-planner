@@ -40,8 +40,7 @@ use std::ops::{ControlFlow, Deref};
 use std::str::FromStr;
 use std::sync::Arc;
 
-/// The column index of the measurement column.
-const INFLUXQL_MEASUREMENT_COLUMN_NAME: &str = "iox::measurement";
+
 
 /// Informs the planner which rules should be applied when transforming
 /// an InfluxQL expression.
@@ -255,12 +254,12 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
 
         // UNION the remaining plans
         let plan =
-            dbg!(plan_and_schemas
+            plan_and_schemas
                 .into_iter()
                 .try_fold(plan, |prev, (next, next_schema)| {
                     let next = self.project_select(next, select, &fields, next_schema)?;
                     LogicalPlanBuilder::from(prev).union(next)?.build()
-                })?);
+                })?;
 
         // Construct the sort logical operator
         //
@@ -958,6 +957,9 @@ mod test {
     use crate::test_utils::{parse_select, MockSchemaBuilder, MockSchemaProvider};
     use influxql_parser::parse_statements;
     use insta::assert_snapshot;
+
+    /// The column index of the measurement column.
+    const INFLUXQL_MEASUREMENT_COLUMN_NAME: &str = "iox::measurement";
 
     fn logical_plan(sql: &str) -> Result<LogicalPlan> {
         let mut statements = parse_statements(sql).unwrap();
