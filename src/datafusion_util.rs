@@ -1,11 +1,29 @@
 use std::sync::Arc;
 
 use arrow::datatypes::DataType;
+use datafusion::common::{DataFusionError, Result, ToDFSchema};
+use datafusion::optimizer::alias;
+use datafusion::prelude::{max, min, sum};
 use datafusion::{
     logical_expr::expr::Sort,
     prelude::{lit, Column, Expr},
     scalar::ScalarValue,
 };
+
+pub fn aggr_expr(func: &str, base: Expr) -> Result<Expr> {
+    let expr = match func {
+        "sum" => sum(base),
+        "min" => min(base),
+        "max" => max(base),
+        _ => {
+            return Err(DataFusionError::Plan(format!(
+                "Unsupported aggr func, name:{func}"
+            )))
+        }
+    };
+
+    Ok(expr)
+}
 
 /// Traits to help creating DataFusion [`Expr`]s
 pub trait AsExpr {

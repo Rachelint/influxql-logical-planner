@@ -1,44 +1,52 @@
-use crate::datafusion_util::{lit_dict, AsExpr};
-use crate::planner_rewrite_expression::{rewrite_conditional, rewrite_expr};
-use crate::planner_time_range_expression::time_range_to_df_expr;
-use crate::provider::{InfluxColumnType, InfluxFieldType, Schema, SchemaProvider, Schemas};
-use crate::rewriter::rewrite_statement;
-use crate::util::{self, binary_operator_to_df_operator};
-use crate::var_ref::{column_type_to_var_ref_data_type, var_ref_data_type_to_data_type};
-use arrow::datatypes::DataType;
+use std::{
+    collections::{HashSet, VecDeque},
+    fmt::{format, Debug},
+    iter,
+    ops::{ControlFlow, Deref},
+    str::FromStr,
+    sync::Arc,
+};
 
-use datafusion::common::{DataFusionError, Result, ScalarValue, ToDFSchema};
-use datafusion::logical_expr::expr_rewriter::{normalize_col, ExprRewritable, ExprRewriter};
-use datafusion::logical_expr::logical_plan::builder::project;
-use datafusion::logical_expr::logical_plan::Analyze;
-use datafusion::logical_expr::{
-    binary_expr, lit, BinaryExpr, BuiltinScalarFunction, Explain, Expr, ExprSchemable, LogicalPlan,
-    LogicalPlanBuilder, Operator, PlanType, Projection, ToStringifiedPlan,
+use arrow::datatypes::DataType;
+use datafusion::{
+    common::{DataFusionError, Result, ScalarValue, ToDFSchema},
+    logical_expr::{
+        binary_expr,
+        expr_rewriter::{normalize_col, ExprRewritable, ExprRewriter},
+        lit,
+        logical_plan::{builder::project, Analyze},
+        BinaryExpr, BuiltinScalarFunction, Explain, Expr, ExprSchemable, LogicalPlan,
+        LogicalPlanBuilder, Operator, PlanType, Projection, ToStringifiedPlan,
+    },
+    prelude::Column,
 };
-use influxql_parser::common::OrderByClause;
-use influxql_parser::explain::{ExplainOption, ExplainStatement};
-use influxql_parser::expression::walk::walk_expr;
-use influxql_parser::expression::{
-    BinaryOperator, ConditionalExpression, ConditionalOperator, VarRefDataType,
-};
-use influxql_parser::select::{Dimension, SLimitClause, SOffsetClause};
 use influxql_parser::{
-    common::{LimitClause, MeasurementName, OffsetClause, WhereClause},
-    expression::Expr as IQLExpr,
+    common::{LimitClause, MeasurementName, OffsetClause, OrderByClause, WhereClause, ZeroOrMore},
+    explain::{ExplainOption, ExplainStatement},
+    expression::{
+        walk::walk_expr, BinaryOperator, ConditionalExpression, ConditionalOperator,
+        Expr as IQLExpr, VarRefDataType,
+    },
     identifier::Identifier,
     literal::Literal,
-    select::{Field, FieldList, FromMeasurementClause, MeasurementSelection, SelectStatement},
+    select::{
+        Dimension, Field, FieldList, FromMeasurementClause, MeasurementSelection, SLimitClause,
+        SOffsetClause, SelectStatement,
+    },
     statement::Statement,
 };
 use itertools::Itertools;
 use once_cell::sync::Lazy;
-use std::collections::{HashSet, VecDeque};
 
-use std::fmt::{format, Debug};
-use std::iter;
-use std::ops::{ControlFlow, Deref};
-use std::str::FromStr;
-use std::sync::Arc;
+use crate::{
+    datafusion_util::{self, lit_dict, AsExpr},
+    planner_rewrite_expression::{rewrite_conditional, rewrite_expr},
+    planner_time_range_expression::time_range_to_df_expr,
+    provider::{InfluxColumnType, InfluxFieldType, Schema, SchemaProvider, Schemas},
+    rewriter::rewrite_statement,
+    util::{self, binary_operator_to_df_operator},
+    var_ref::{column_type_to_var_ref_data_type, var_ref_data_type_to_data_type},
+};
 
 /// The column index of the measurement column.
 const INFLUXQL_MEASUREMENT_COLUMN_NAME: &str = "iox::measurement";
@@ -46,8 +54,8 @@ const INFLUXQL_MEASUREMENT_COLUMN_NAME: &str = "iox::measurement";
 /// Informs the planner which rules should be applied when transforming
 /// an InfluxQL expression.
 ///
-/// Specifically, the scope of available functions is narrowed to mathematical scalar functions
-/// when processing the `WHERE` clause.
+/// Specifically, the scope of available functions is narrowed to mathematical
+/// scalar functions when processing the `WHERE` clause.
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum ExprScope {
     /// Signals that expressions should be transformed in the context of
@@ -136,21 +144,14 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
     }
 
     fn rewrite_select_statement(&self, select: SelectStatement) -> Result<SelectStatement> {
-        rewrite_statement(self.s, &select)
+        // TODO: reopen
+        // rewrite_statement(self.s, &select)
+        Ok(select)
     }
 
     /// Create a [`LogicalPlan`] from the specified InfluxQL `SELECT` statement.
     fn select_statement_to_plan(&self, select: &SelectStatement) -> Result<LogicalPlan> {
         let mut plan_and_schemas = self.plan_and_schema_from_tables(&select.from)?;
-
-        // Aggregate functions are currently not supported.
-        //
-        // See: https://github.com/influxdata/influxdb_iox/issues/6919
-        if has_aggregate_exprs(&select.fields) {
-            return Err(DataFusionError::NotImplemented(
-                "aggregate functions".to_owned(),
-            ));
-        }
 
         // The `time` column is always present in the result set
         let mut fields = if !has_time_column(&select.fields) {
@@ -179,7 +180,8 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
                     Dimension::Time { .. } => {
                         Err(DataFusionError::NotImplemented("GROUP BY time".to_owned()))
                     }
-                    // Inconsistent state, as these variants should have been expanded by `rewrite_select_statement`
+                    // Inconsistent state, as these variants should have been expanded by
+                    // `rewrite_select_statement`
                     Dimension::Regex(_) | Dimension::Wildcard => Err(DataFusionError::Internal(
                         "unexpected regular expression or wildcard found in GROUP BY".into(),
                     )),
@@ -195,8 +197,8 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
             // Tags specified in the `GROUP BY` clause that are not already added to the
             // projection must be projected, so they key be used in the group key.
             //
-            // At the end of the loop, the `tag_columns` set will contain the tag columns that
-            // exist in the projection and not in the `GROUP BY`.
+            // At the end of the loop, the `tag_columns` set will contain the tag columns
+            // that exist in the projection and not in the `GROUP BY`.
             for col in &tag_set {
                 if tag_columns.remove(*col) {
                     continue;
@@ -233,11 +235,22 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
             }
         };
 
-        let plan = self.project_select(plan, select, &fields, schema)?;
+        println!(
+            "111:{plan:?}, schema:{:?}, select:{select:?}, fields:{fields:?}",
+            schema.columns()
+        );
+
+        let plan = self.project_select(plan, select, &fields, schema.clone())?;
+        println!("222:{plan:?}");
+
+        let aggr_exprs = find_aggregate_exprs(&select.fields);
+        println!("333:{aggr_exprs:?}");
+        let plan = self.aggregate(plan, aggr_exprs, &group_by_tag_set, schema)?;
+        println!("after aggr:{plan:?}");
 
         // If there are multiple measurements, we need to sort by the measurement column
-        // NOTE: Ideally DataFusion would maintain the order of the UNION ALL, which would eliminate
-        //  the need to sort by measurement.
+        // NOTE: Ideally DataFusion would maintain the order of the UNION ALL, which
+        // would eliminate  the need to sort by measurement.
         //  See: https://github.com/influxdata/influxdb_iox/issues/7062
         let mut series_sort = if !plan_and_schemas.is_empty() {
             vec![Expr::sort(
@@ -262,11 +275,13 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
         //
         // The ordering of the results is as follows:
         //
-        // iox::measurement, [group by tag 0, .., group by tag n], time, [projection tag 0, .., projection tag n]
+        // iox::measurement, [group by tag 0, .., group by tag n], time, [projection tag
+        // 0, .., projection tag n]
         //
         // NOTE:
         //
-        // Sort expressions referring to tag keys are always specified in lexicographically ascending order.
+        // Sort expressions referring to tag keys are always specified in
+        // lexicographically ascending order.
         let plan = {
             if !group_by_tag_set.is_empty() {
                 // Adding `LIMIT` or `OFFSET` with a `GROUP BY tag, ...` clause is not supported
@@ -290,7 +305,8 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
             series_sort.push(Expr::sort(
                 "time".as_expr(),
                 match select.order_by {
-                    // Default behaviour is to sort by time in ascending order if there is no ORDER BY
+                    // Default behaviour is to sort by time in ascending order if there is no ORDER
+                    // BY
                     None | Some(OrderByClause::Ascending) => true,
                     Some(OrderByClause::Descending) => false,
                 },
@@ -312,6 +328,7 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
 
         let plan = self.slimit(plan, select.series_offset, select.series_limit)?;
 
+        println!("plan is\n:{plan:?}\n");
         Ok(plan)
     }
 
@@ -345,8 +362,57 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
         project(plan, proj.into_iter().chain(select_exprs.into_iter()))
     }
 
-    /// Optionally wrap the input logical plan in a [`LogicalPlan::Limit`] node using the specified
-    /// `offset` and `limit`.
+    fn aggregate(
+        &self,
+        input: LogicalPlan,
+        aggr_exprs: FieldList,
+        group_by_exprs: &[&str],
+        schema: Arc<dyn Schema>,
+    ) -> Result<LogicalPlan> {
+        if aggr_exprs.is_empty() {
+            return Ok(input);
+        }
+
+        let schemas = Schemas {
+            df_schema: input.schema().clone(),
+            iox_schema: schema,
+        };
+
+        println!("444:{aggr_exprs:?}");
+        let aggr_exprs = self.field_list_to_exprs(&input, &aggr_exprs, &schemas)?;
+        println!("555:{aggr_exprs:?}");
+
+        let group_by_exprs = group_by_exprs
+            .iter()
+            .map(|name| {
+                let expr = IQLExpr::VarRef {
+                    name: name.clone().into(),
+                    data_type: Some(VarRefDataType::Tag),
+                };
+                Field {
+                    expr,
+                    alias: Some(name.clone().into()),
+                }
+            })
+            .collect::<Vec<_>>();
+        let group_by_exprs = self.field_list_to_exprs(&input, &group_by_exprs, &schemas)?;
+
+        let aggr_exprs =
+            vec![
+                datafusion_util::aggr_expr("sum", Expr::Column(Column::from_name("field1")))
+                    .unwrap(),
+            ];
+        println!(
+            "666:{aggr_exprs:?}, by:{group_by_exprs:?},input:{:?}",
+            input.schema()
+        );
+        LogicalPlanBuilder::from(input)
+            .aggregate(group_by_exprs, aggr_exprs)?
+            .build()
+    }
+
+    /// Optionally wrap the input logical plan in a [`LogicalPlan::Limit`] node
+    /// using the specified `offset` and `limit`.
     fn limit(
         &self,
         input: LogicalPlan,
@@ -363,12 +429,13 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
         LogicalPlanBuilder::from(input).limit(skip, fetch)?.build()
     }
 
-    /// Verifies the `SLIMIT` and `SOFFSET` clauses are `None`; otherwise, return a
-    /// `NotImplemented` error.
+    /// Verifies the `SLIMIT` and `SOFFSET` clauses are `None`; otherwise,
+    /// return a `NotImplemented` error.
     ///
     /// ## Why?
     /// * `SLIMIT` and `SOFFSET` don't work as expected per issue [#7571]
-    /// * This issue [is noted](https://docs.influxdata.com/influxdb/v1.8/query_language/explore-data/#the-slimit-clause) in our official documentation
+    /// * This issue [is noted](https://docs.influxdata.com/influxdb/v1.8/query_language/explore-data/#the-slimit-clause)
+    ///   in our official documentation
     ///
     /// [#7571]: https://github.com/influxdata/influxdb/issues/7571
     fn slimit(
@@ -384,7 +451,8 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
         Err(DataFusionError::NotImplemented("SLIMIT or SOFFSET".into()))
     }
 
-    /// Map the InfluxQL `SELECT` projection list into a list of DataFusion expressions.
+    /// Map the InfluxQL `SELECT` projection list into a list of DataFusion
+    /// expressions.
     fn field_list_to_exprs(
         &self,
         plan: &LogicalPlan,
@@ -579,9 +647,17 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
             self.scalar_math_func_to_df_expr(scope, name, args, schemas)
         } else {
             match scope {
-                ExprScope::Projection => Err(DataFusionError::NotImplemented(
-                    "aggregate and selector functions in projection list".into(),
-                )),
+                ExprScope::Projection => {
+                    if args.len() != 1 {
+                        return Err(DataFusionError::NotImplemented(format!(
+                            "aggregate functions only support one column, current:{args:?}",
+                        )));
+                    }
+
+                    self.expr_to_df_expr(scope, &args[0], schemas)
+                        .and_then(|expr| datafusion_util::aggr_expr(name, expr))
+                    // .map(|expr| expr.alias("field1"))
+                }
                 ExprScope::Where => {
                     if name.eq_ignore_ascii_case("now") {
                         Err(DataFusionError::NotImplemented("now".into()))
@@ -595,7 +671,8 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
         }
     }
 
-    /// Map the InfluxQL scalar function call to a DataFusion scalar function expression.
+    /// Map the InfluxQL scalar function call to a DataFusion scalar function
+    /// expression.
     fn scalar_math_func_to_df_expr(
         &self,
         scope: ExprScope,
@@ -649,8 +726,8 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
         }
     }
 
-    /// Generate a list of logical plans for each of the tables references in the `FROM`
-    /// clause.
+    /// Generate a list of logical plans for each of the tables references in
+    /// the `FROM` clause.
     fn plan_and_schema_from_tables(
         &self,
         from: &FromMeasurementClause,
@@ -693,8 +770,8 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
 
     /// Create a [LogicalPlan] that refers to the specified `table_name`.
     ///
-    /// Normally, this functions will not return a `None`, as tables have been matched]
-    /// by the [`rewrite_statement`] function.
+    /// Normally, this functions will not return a `None`, as tables have been
+    /// matched] by the [`rewrite_statement`] function.
     fn create_table_ref(&self, table_name: String) -> Result<LogicalPlan> {
         let source = self.s.get_table_provider(&table_name).map_err(|_e| {
             DataFusionError::Internal(format!(
@@ -719,6 +796,22 @@ fn has_aggregate_exprs(fields: &FieldList) -> bool {
     })
 }
 
+fn find_aggregate_exprs(fields: &FieldList) -> FieldList {
+    let contents = fields
+        .iter()
+        .filter(|f| {
+            walk_expr(&f.expr, &mut |e| match e {
+                IQLExpr::Call { name, .. } if is_aggregate_function(name) => ControlFlow::Break(()),
+                _ => ControlFlow::Continue(()),
+            })
+            .is_break()
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+
+    ZeroOrMore::new(contents)
+}
+
 /// Find all the tag columns projected in the `SELECT` from the field list.
 fn find_tag_columns<'a, T: FromIterator<&'a str>>(fields: &'a FieldList) -> T {
     fields
@@ -737,8 +830,8 @@ fn find_tag_columns<'a, T: FromIterator<&'a str>>(fields: &'a FieldList) -> T {
         .collect()
 }
 
-/// Perform a series of passes to rewrite `expr` in compliance with InfluxQL behavior
-/// in an effort to ensure the query executes without error.
+/// Perform a series of passes to rewrite `expr` in compliance with InfluxQL
+/// behavior in an effort to ensure the query executes without error.
 fn rewrite_conditional_expr(expr: Expr, schemas: &Schemas) -> Result<Expr> {
     let expr = expr.rewrite(&mut FixRegularExpressions { schemas })?;
     rewrite_conditional(expr, schemas)
@@ -795,7 +888,8 @@ impl<'a> ExprRewriter for FixRegularExpressions<'a> {
                     // * https://github.com/influxdata/influxdb/blob/9308b6586a44e5999180f64a96cfb91e372f04dd/tsdb/index.go#L2487-L2488
                     // * https://github.com/influxdata/influxdb/blob/9308b6586a44e5999180f64a96cfb91e372f04dd/tsdb/index.go#L2509-L2510
                     //
-                    // The query engine does not correctly evaluate tag keys and values, always evaluating to false.
+                    // The query engine does not correctly evaluate tag keys and values, always
+                    // evaluating to false.
                     //
                     // Reference example:
                     //
@@ -859,7 +953,8 @@ fn is_scalar_math_function(name: &str) -> bool {
     SCALAR_MATH_FUNCTIONS.contains(name)
 }
 
-/// A list of valid aggregate and aggregate-like functions supported by InfluxQL.
+/// A list of valid aggregate and aggregate-like functions supported by
+/// InfluxQL.
 ///
 /// A full list is available via the [InfluxQL documentation][docs].
 ///
@@ -928,7 +1023,8 @@ fn is_aggregate_function(name: &str) -> bool {
 /// Returns true if the conditional expression is a single node that
 /// refers to the `time` column.
 ///
-/// In a conditional expression, this comparison is case-insensitive per the [Go implementation][go]
+/// In a conditional expression, this comparison is case-insensitive per the [Go
+/// implementation][go]
 ///
 /// [go]: https://github.com/influxdata/influxql/blob/1ba470371ec093d57a726b143fe6ccbacf1b452b/ast.go#L5751-L5753
 fn is_time_field(cond: &ConditionalExpression) -> bool {
@@ -947,13 +1043,13 @@ fn find_expr(cond: &ConditionalExpression) -> Result<&IQLExpr> {
     cond.expr()
         .ok_or_else(|| DataFusionError::Internal("incomplete conditional expression".into()))
 }
-
 #[cfg(test)]
 mod test {
-    use super::*;
-    use crate::test_utils::{parse_select, MockSchemaBuilder, MockSchemaProvider};
     use influxql_parser::parse_statements;
     use insta::assert_snapshot;
+
+    use super::*;
+    use crate::test_utils::{parse_select, MockSchemaBuilder, MockSchemaProvider};
 
     fn logical_plan(sql: &str) -> Result<LogicalPlan> {
         let mut statements = parse_statements(sql).unwrap();
@@ -1020,12 +1116,13 @@ mod test {
         assert_snapshot!(plan("SHOW FIELD KEYS"), @"This feature is not implemented: SHOW FIELD KEYS");
     }
 
-    /// Tests to validate InfluxQL `SELECT` statements, where the projections do not matter,
-    /// such as the WHERE clause.
+    /// Tests to validate InfluxQL `SELECT` statements, where the projections do
+    /// not matter, such as the WHERE clause.
     mod select {
         use super::*;
 
-        /// Verify the behaviour of the `FROM` clause when selecting from zero to many measurements.
+        /// Verify the behaviour of the `FROM` clause when selecting from zero
+        /// to many measurements.
         #[test]
         fn test_from_zero_to_many() {
             assert_snapshot!(plan("SELECT host, cpu, device, usage_idle, bytes_used FROM cpu, disk"), @r###"
@@ -1375,7 +1472,8 @@ mod test {
         }
     }
 
-    /// Tests to validate InfluxQL `SELECT` statements that utilise aggregate functions.
+    /// Tests to validate InfluxQL `SELECT` statements that utilise aggregate
+    /// functions.
     mod select_aggregate {
         use super::*;
 
@@ -1385,8 +1483,8 @@ mod test {
         }
     }
 
-    /// Tests to validate InfluxQL `SELECT` statements that project columns without specifying
-    /// aggregates or `GROUP BY time()` with gap filling.
+    /// Tests to validate InfluxQL `SELECT` statements that project columns
+    /// without specifying aggregates or `GROUP BY time()` with gap filling.
     mod select_raw {
         use super::*;
 
@@ -1500,7 +1598,8 @@ mod test {
         }
 
         #[test]
-        // TODO: the result snapshot is different with the one in influxdb_iox due to the old version of datafusion.
+        // TODO: the result snapshot is different with the one in influxdb_iox due to
+        // the old version of datafusion.
         fn test_select_multiple_measurements_group_by() {
             // Sort should be iox::measurement, cpu, time
             assert_snapshot!(plan("SELECT usage_idle, free FROM cpu, disk GROUP BY cpu"), @r###"
@@ -1590,14 +1689,15 @@ mod test {
         // assert_snapshot!(plan("SELECT * FROM data_1"));
 
         //
-        // Scenarios: measurement exists, mixture of fields that do and don't exist
+        // Scenarios: measurement exists, mixture of fields that do and don't
+        // exist
         //
         // assert_snapshot!(plan("SELECT f64_field, missing FROM data"));
         // assert_snapshot!(plan("SELECT foo, missing FROM data"));
 
         //
-        // Scenarios: Mathematical scalar functions in the projection list, including
-        // those in arithmetic expressions.
+        // Scenarios: Mathematical scalar functions in the projection list,
+        // including those in arithmetic expressions.
         //
         // assert_snapshot!(plan("SELECT abs(f64_field) FROM data"));
         // assert_snapshot!(plan("SELECT ceil(f64_field) FROM data"));
@@ -1610,13 +1710,13 @@ mod test {
         //
 
         //
-        // Scenarios: WHERE clause with time range, now function and literal values
-        // See `getTimeRange`: https://github.com/influxdata/influxql/blob/1ba470371ec093d57a726b143fe6ccbacf1b452b/ast.go#L5791
+        // Scenarios: WHERE clause with time range, now function and literal
+        // values See `getTimeRange`: https://github.com/influxdata/influxql/blob/1ba470371ec093d57a726b143fe6ccbacf1b452b/ast.go#L5791
         //
 
         //
-        // Scenarios: WHERE clause with conditional expressions for tag and field
-        // references, including
+        // Scenarios: WHERE clause with conditional expressions for tag and
+        // field references, including
         //
         // * arithmetic expressions,
         // * regular expressions
@@ -1653,12 +1753,15 @@ mod test {
         // * regular expression matching
     }
 
-    /// This module contains esoteric features of InfluxQL that are identified during
-    /// the development of other features, and require additional work to implement or resolve.
+    /// This module contains esoteric features of InfluxQL that are identified
+    /// during the development of other features, and require additional
+    /// work to implement or resolve.
     ///
-    /// These tests are all ignored and will be promoted to the `test` module when resolved.
+    /// These tests are all ignored and will be promoted to the `test` module
+    /// when resolved.
     ///
-    /// By containing them in a submodule, they appear neatly grouped together in test output.
+    /// By containing them in a submodule, they appear neatly grouped together
+    /// in test output.
     mod issues {
         use super::*;
 
@@ -1667,7 +1770,8 @@ mod test {
         /// **Expected:**
         /// Succeeds and returns null values for the expression
         /// **Actual:**
-        /// Error during planning: 'Float64 + Utf8' can't be evaluated because there isn't a common type to coerce the types to
+        /// Error during planning: 'Float64 + Utf8' can't be evaluated because
+        /// there isn't a common type to coerce the types to
         #[test]
         #[ignore]
         fn test_select_coercion_from_str() {
@@ -1675,11 +1779,14 @@ mod test {
         }
 
         /// **Issue:**
-        /// InfluxQL identifiers are case-sensitive and query fails to ignore unknown identifiers
-        /// **Expected:**
-        /// Succeeds and plans the query, returning null values for unknown columns
-        /// **Actual:**
-        /// Schema error: No field named 'TIME'. Valid fields are 'data'.'bar', 'data'.'bool_field', 'data'.'f64_field', 'data'.'foo', 'data'.'i64_field', 'data'.'mixedCase', 'data'.'str_field', 'data'.'time', 'data'.'with space'.
+        /// InfluxQL identifiers are case-sensitive and query fails to ignore
+        /// unknown identifiers **Expected:**
+        /// Succeeds and plans the query, returning null values for unknown
+        /// columns **Actual:**
+        /// Schema error: No field named 'TIME'. Valid fields are 'data'.'bar',
+        /// 'data'.'bool_field', 'data'.'f64_field', 'data'.'foo',
+        /// 'data'.'i64_field', 'data'.'mixedCase', 'data'.'str_field',
+        /// 'data'.'time', 'data'.'with space'.
         #[test]
         #[ignore]
         fn test_select_case_sensitivity() {
