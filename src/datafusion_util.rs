@@ -1,6 +1,5 @@
 use std::sync::Arc;
 
-use arrow::datatypes::DataType;
 use datafusion::{
     logical_expr::expr::Sort,
     prelude::{lit, Column, Expr},
@@ -59,19 +58,4 @@ pub fn lit_dict(value: &str) -> Expr {
     //     Box::new(ScalarValue::new_utf8(value)),
     // ))
     lit(ScalarValue::Utf8(Some(value.to_string())))
-}
-
-/// Creates expression like:
-/// start <= time && time < end
-pub fn make_range_expr(start: i64, end: i64, time: impl AsRef<str>) -> Expr {
-    // We need to cast the start and end values to timestamps
-    // the equivalent of:
-    let ts_start = ScalarValue::TimestampNanosecond(Some(start), None);
-    let ts_end = ScalarValue::TimestampNanosecond(Some(end), None);
-
-    let time_col = time.as_ref().as_expr();
-    let ts_low = lit(ts_start).lt_eq(time_col.clone());
-    let ts_high = time_col.lt(lit(ts_end));
-
-    ts_low.and(ts_high)
 }
